@@ -18,25 +18,89 @@ import {
   Trash2,
   Clock,
   Download,
-  Globe
+  Globe,
+  Mic,
+  MicOff
 } from 'lucide-react';
 import { Agent, Message, SimulationState, HistoryItem } from './types';
-import { generateAgents, simulateDebate, synthesizeForesight } from './services/gemini';
+import { generateAgents, simulateDebate, synthesizeForesight, generateAvatar } from './services/gemini';
+import { TRANSLATIONS } from './translations';
+import { db, auth, signIn, signOut, handleFirestoreError, OperationType } from './firebase';
+import { doc, onSnapshot, setDoc, updateDoc, collection } from 'firebase/firestore';
+import { onAuthStateChanged, User } from 'firebase/auth';
+
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
+  state: { hasError: boolean, error: any };
+  props: { children: React.ReactNode };
+
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+    this.props = props;
+  }
+
+  static getDerivedStateFromError(error: any) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "Something went wrong.";
+      try {
+        const parsed = JSON.parse(this.state.error.message);
+        errorMessage = `Firestore Error: ${parsed.error} (${parsed.operationType} at ${parsed.path})`;
+      } catch (e) {
+        errorMessage = this.state.error.message || String(this.state.error);
+      }
+
+      return (
+        <div className="min-h-screen bg-[#0a0502] text-white flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-white/5 border border-white/10 rounded-3xl p-8 text-center">
+            <AlertCircle className="w-12 h-12 text-red-500 mx-auto mb-4" />
+            <h2 className="text-xl font-bold mb-2">Application Error</h2>
+            <p className="text-sm opacity-60 mb-6">{errorMessage}</p>
+            <button 
+              onClick={() => window.location.reload()}
+              className="px-6 py-3 bg-[#ff4e00] rounded-xl font-bold hover:bg-[#ff6a26] transition-colors"
+            >
+              Reload Application
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+const PREMADE_AVATAR_STYLES = [
+  { name: 'Robots', value: 'bottts' },
+  { name: 'Avatars', value: 'avataaars' },
+  { name: 'Pixel Art', value: 'pixel-art' },
+  { name: 'Big Ears', value: 'big-ears' },
+  { name: 'Miniavs', value: 'miniavs' },
+  { name: 'Croodles', value: 'croodles' },
+  { name: 'Fun Emoji', value: 'fun-emoji' },
+  { name: 'Lorelei', value: 'lorelei' },
+  { name: 'Notionists', value: 'notionists' },
+  { name: 'Open Peeps', value: 'open-peeps' },
+  { name: 'Personas', value: 'personas' },
+];
 
 const LANGUAGES = [
-  { label: 'English', value: 'English' },
-  { label: 'Hindi (हिन्दी)', value: 'Hindi' },
-  { label: 'Bengali (বাংলা)', value: 'Bengali' },
-  { label: 'Tamil (தமிழ்)', value: 'Tamil' },
-  { label: 'Telugu (తెలుగు)', value: 'Telugu' },
-  { label: 'Marathi (मराठी)', value: 'Marathi' },
-  { label: 'Gujarati (ગુજરાતી)', value: 'Gujarati' },
-  { label: 'Kannada (ಕನ್ನಡ)', value: 'Kannada' },
-  { label: 'Malayalam (മലയാളം)', value: 'Malayalam' },
-  { label: 'Punjabi (ਪੰਜਾਬੀ)', value: 'Punjabi' },
-  { label: 'Spanish', value: 'Spanish' },
-  { label: 'French', value: 'French' },
-  { label: 'German', value: 'German' },
+  { label: 'English', value: 'English', code: 'en-US' },
+  { label: 'Hindi (हिन्दी)', value: 'Hindi', code: 'hi-IN' },
+  { label: 'Bengali (বাংলা)', value: 'Bengali', code: 'bn-IN' },
+  { label: 'Tamil (தமிழ்)', value: 'Tamil', code: 'ta-IN' },
+  { label: 'Telugu (తెలుగు)', value: 'Telugu', code: 'te-IN' },
+  { label: 'Marathi (मराठी)', value: 'Marathi', code: 'mr-IN' },
+  { label: 'Gujarati (ગુજરાતી)', value: 'Gujarati', code: 'gu-IN' },
+  { label: 'Kannada (ಕನ್ನಡ)', value: 'Kannada', code: 'kn-IN' },
+  { label: 'Malayalam (മലയാളം)', value: 'Malayalam', code: 'ml-IN' },
+  { label: 'Punjabi (ਪੰਜਾਬੀ)', value: 'Punjabi', code: 'pa-IN' },
+  { label: 'Spanish', value: 'Spanish', code: 'es-ES' },
+  { label: 'French', value: 'French', code: 'fr-FR' },
+  { label: 'German', value: 'German', code: 'de-DE' },
 ];
 
 export default function App() {
@@ -50,12 +114,77 @@ export default function App() {
   });
 
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isCustomizingAgent, setIsCustomizingAgent] = useState<string | null>(null);
+  const [isGeneratingAvatar, setIsGeneratingAvatar] = useState(false);
+  const [customAvatarPrompt, setCustomAvatarPrompt] = useState('');
   const [copied, setCopied] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [agentReputations, setAgentReputations] = useState<Record<string, number>>({});
+  const [user, setUser] = useState<User | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(window.location.hash.slice(1) || null);
+  const [historyFilters, setHistoryFilters] = useState({
+    query: '',
+    startDate: '',
+    endDate: '',
+    agentRole: ''
+  });
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Load history from localStorage
+  // Auth listener
+  useEffect(() => {
+    return onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+  }, []);
+
+  // Hash listener for session ID
+  useEffect(() => {
+    const handleHashChange = () => {
+      setSessionId(window.location.hash.slice(1) || null);
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  // Real-time sync for shared session
+  useEffect(() => {
+    if (!sessionId || !user) return;
+
+    const path = `simulations/${sessionId}`;
+    const unsubscribe = onSnapshot(doc(db, 'simulations', sessionId), (snapshot) => {
+      if (snapshot.exists()) {
+        const data = snapshot.data();
+        // Only update if we are NOT the one currently simulating (to avoid local state conflicts)
+        // Or if the status is different
+        setState(prev => {
+          if (prev.status === 'simulating' && data.status === 'simulating' && data.messages.length <= prev.messages.length) {
+            return prev;
+          }
+          return {
+            ...prev,
+            question: data.question,
+            language: data.language,
+            status: data.status,
+            agents: data.agents,
+            messages: data.messages,
+            synthesis: data.synthesis,
+            error: data.error
+          };
+        });
+      }
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, path);
+    });
+
+    return () => unsubscribe();
+  }, [sessionId, user]);
+
+  // Load history, reputations, and draft question from localStorage
   useEffect(() => {
     const savedHistory = localStorage.getItem('mirofish_history');
+    const savedReputations = localStorage.getItem('mirofish_reputations');
+    const savedDraft = localStorage.getItem('mirofish_draft_question');
+    
     if (savedHistory) {
       try {
         setState(prev => ({ ...prev, history: JSON.parse(savedHistory) }));
@@ -63,12 +192,38 @@ export default function App() {
         console.error("Failed to parse history", e);
       }
     }
+
+    if (savedReputations) {
+      try {
+        setAgentReputations(JSON.parse(savedReputations));
+      } catch (e) {
+        console.error("Failed to parse reputations", e);
+      }
+    }
+
+    if (savedDraft) {
+      setState(prev => ({ ...prev, question: savedDraft }));
+    }
   }, []);
 
   // Save history to localStorage
   useEffect(() => {
     localStorage.setItem('mirofish_history', JSON.stringify(state.history));
   }, [state.history]);
+
+  // Save reputations to localStorage
+  useEffect(() => {
+    localStorage.setItem('mirofish_reputations', JSON.stringify(agentReputations));
+  }, [agentReputations]);
+
+  // Autosave question draft
+  useEffect(() => {
+    if (state.question) {
+      localStorage.setItem('mirofish_draft_question', state.question);
+    } else {
+      localStorage.removeItem('mirofish_draft_question');
+    }
+  }, [state.question]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -79,6 +234,88 @@ export default function App() {
       scrollToBottom();
     }
   }, [state.messages]);
+
+  const handleRegenerateAvatar = async (agentId: string) => {
+    const agent = state.agents.find(a => a.id === agentId);
+    if (!agent) return;
+
+    setIsGeneratingAvatar(true);
+    try {
+      const newAvatar = await generateAvatar(agent.role, agent.name, customAvatarPrompt);
+      setState(prev => ({
+        ...prev,
+        agents: prev.agents.map(a => a.id === agentId ? { ...a, avatar: newAvatar } : a)
+      }));
+      setCustomAvatarPrompt(''); // Reset prompt after generation
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsGeneratingAvatar(false);
+    }
+  };
+
+  const handleSelectPremadeAvatar = (agentId: string, style: string) => {
+    const agent = state.agents.find(a => a.id === agentId);
+    if (!agent) return;
+
+    const newAvatar = `https://api.dicebear.com/7.x/${style}/svg?seed=${agent.name}-${Date.now()}`;
+    setState(prev => ({
+      ...prev,
+      agents: prev.agents.map(a => a.id === agentId ? { ...a, avatar: newAvatar } : a)
+    }));
+  };
+
+  const filteredHistory = state.history.filter(item => {
+    const matchesQuery = item.question.toLowerCase().includes(historyFilters.query.toLowerCase());
+    const matchesAgent = !historyFilters.agentRole || item.agents.some(a => a.role === historyFilters.agentRole);
+    const matchesStartDate = !historyFilters.startDate || item.timestamp >= new Date(historyFilters.startDate).getTime();
+    const matchesEndDate = !historyFilters.endDate || item.timestamp <= new Date(historyFilters.endDate).getTime() + 86400000;
+    return matchesQuery && matchesAgent && matchesStartDate && matchesEndDate;
+  });
+
+  const allRoles = Array.from(new Set(state.history.flatMap(item => item.agents.map(a => a.role))));
+
+  const t = TRANSLATIONS[state.language] || TRANSLATIONS.English;
+
+  const toggleListening = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      alert('Speech recognition is not supported in this browser.');
+      return;
+    }
+
+    if (isListening) {
+      setIsListening(false);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    const currentLang = LANGUAGES.find(l => l.value === state.language);
+    recognition.lang = currentLang?.code || 'en-US';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+
+    recognition.onstart = () => {
+      setIsListening(true);
+    };
+
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      setState(prev => ({ ...prev, question: transcript }));
+      setIsListening(false);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error('Speech recognition error', event.error);
+      setIsListening(false);
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+    };
+
+    recognition.start();
+  };
 
   const exportToTxt = (question: string, agents: Agent[], messages: Message[], synthesis: string) => {
     const content = `
@@ -118,30 +355,108 @@ Generated by MiroFish Systems
     e.preventDefault();
     if (!state.question.trim()) return;
 
+    if (!user) {
+      try {
+        await signIn();
+        return; // Stop here, user needs to click again after sign in or we can continue
+      } catch (error) {
+        console.error("Sign in failed", error);
+        return;
+      }
+    }
+
+    const newSessionId = Date.now().toString();
+    setSessionId(newSessionId);
+    window.location.hash = newSessionId;
+
+    const initialState: any = {
+      question: state.question,
+      language: state.language,
+      status: 'initializing',
+      agents: [],
+      messages: [],
+      timestamp: Date.now(),
+      lastUpdated: Date.now(),
+      createdBy: user.uid
+    };
+
+    const path = `simulations/${newSessionId}`;
+    try {
+      await setDoc(doc(db, 'simulations', newSessionId), initialState);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.CREATE, path);
+    }
+
     setState(prev => ({ ...prev, status: 'initializing', agents: [], messages: [], synthesis: undefined }));
 
     try {
-      const agents = await generateAgents(state.question, state.language);
+      const agents = await generateAgents(state.question, state.language, agentReputations);
+      
+      await updateDoc(doc(db, 'simulations', newSessionId), {
+        status: 'simulating',
+        agents,
+        lastUpdated: Date.now()
+      });
+
       setState(prev => ({ ...prev, status: 'simulating', agents }));
 
-      const messages = await simulateDebate(state.question, agents, state.language);
+      const { messages, reputationChanges } = await simulateDebate(state.question, agents, state.language);
       
-      // Simulate typing/delay for each message
+      // Update reputations in state
+      setAgentReputations(prev => {
+        const next = { ...prev };
+        agents.forEach(agent => {
+          const change = reputationChanges[agent.id] || 0;
+          next[agent.role] = (next[agent.role] || 100) + change;
+        });
+        return next;
+      });
+
+      // Update current agents with new reputations for synthesis and UI
+      const updatedAgents = agents.map(a => ({
+        ...a,
+        reputation: a.reputation + (reputationChanges[a.id] || 0)
+      }));
+
+      // Update state.agents so UI shows new reputation
+      setState(prev => ({ ...prev, agents: updatedAgents }));
+
+      // Simulate typing/delay for each message and sync to Firestore
+      let currentMessages: Message[] = [];
       for (let i = 0; i < messages.length; i++) {
         await new Promise(resolve => setTimeout(resolve, 1500));
+        currentMessages = [...currentMessages, messages[i]];
+        
+        await updateDoc(doc(db, 'simulations', newSessionId), {
+          messages: currentMessages,
+          lastUpdated: Date.now()
+        });
+
         setState(prev => ({
           ...prev,
-          messages: [...prev.messages, messages[i]]
+          messages: currentMessages
         }));
       }
 
       setState(prev => ({ ...prev, status: 'synthesizing' }));
-      const synthesis = await synthesizeForesight(state.question, messages, agents, state.language);
+      await updateDoc(doc(db, 'simulations', newSessionId), {
+        status: 'synthesizing',
+        lastUpdated: Date.now()
+      });
+
+      const synthesis = await synthesizeForesight(state.question, messages, updatedAgents, state.language);
       
+      await updateDoc(doc(db, 'simulations', newSessionId), {
+        status: 'completed',
+        synthesis,
+        agents: updatedAgents,
+        lastUpdated: Date.now()
+      });
+
       const newHistoryItem: HistoryItem = {
-        id: Date.now().toString(),
+        id: newSessionId,
         question: state.question,
-        agents,
+        agents: updatedAgents,
         messages,
         synthesis,
         timestamp: Date.now(),
@@ -192,6 +507,8 @@ Generated by MiroFish Systems
   };
 
   const reset = () => {
+    window.location.hash = '';
+    setSessionId(null);
     setState(prev => ({
       ...prev,
       status: 'idle',
@@ -202,8 +519,17 @@ Generated by MiroFish Systems
     }));
   };
 
+  const shareSession = () => {
+    if (!sessionId) return;
+    const url = `${window.location.origin}${window.location.pathname}#${sessionId}`;
+    navigator.clipboard.writeText(url);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   return (
-    <div className="min-h-screen bg-[#0a0502] text-[#e0d8d0] font-sans selection:bg-[#ff4e00] selection:text-white overflow-x-hidden">
+    <ErrorBoundary>
+      <div className="min-h-screen bg-[#0a0502] text-[#e0d8d0] font-sans selection:bg-[#ff4e00] selection:text-white overflow-x-hidden">
       {/* Dynamic Background */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
         <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-[#3a1510] rounded-full blur-[120px] opacity-30 animate-pulse" />
@@ -226,22 +552,82 @@ Generated by MiroFish Systems
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
               transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-              className="fixed right-0 top-0 bottom-0 w-full max-w-sm bg-[#150d0a] border-l border-white/10 z-[101] shadow-2xl p-8 flex flex-col"
+              className="fixed right-0 top-0 bottom-0 w-full md:max-w-sm bg-[#150d0a] border-l border-white/10 z-[101] shadow-2xl p-6 md:p-8 flex flex-col"
             >
               <div className="flex items-center justify-between mb-8">
                 <h3 className="text-xl font-bold uppercase tracking-widest flex items-center gap-2">
-                  <Clock className="w-5 h-5 text-[#ff4e00]" /> Remembered
+                  <Clock className="w-5 h-5 text-[#ff4e00]" /> {t.remembered}
                 </h3>
                 <button onClick={() => setIsHistoryOpen(false)} className="opacity-40 hover:opacity-100 transition-opacity">
                   <ChevronRight className="w-6 h-6" />
                 </button>
               </div>
 
+              {/* Advanced Filters */}
+              <div className="mb-6 space-y-3">
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 opacity-40" />
+                  <input 
+                    type="text"
+                    placeholder={t.searchKeywords}
+                    value={historyFilters.query}
+                    onChange={(e) => setHistoryFilters(prev => ({ ...prev, query: e.target.value }))}
+                    className="w-full bg-white/5 border border-white/10 rounded-lg pl-9 pr-4 py-2 text-xs focus:outline-none focus:border-[#ff4e00]/50 transition-all"
+                  />
+                </div>
+                
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <label className="text-[9px] uppercase tracking-widest opacity-40 ml-1">{t.from}</label>
+                    <input 
+                      type="date"
+                      value={historyFilters.startDate}
+                      onChange={(e) => setHistoryFilters(prev => ({ ...prev, startDate: e.target.value }))}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-[10px] focus:outline-none focus:border-[#ff4e00]/50 transition-all"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-[9px] uppercase tracking-widest opacity-40 ml-1">{t.to}</label>
+                    <input 
+                      type="date"
+                      value={historyFilters.endDate}
+                      onChange={(e) => setHistoryFilters(prev => ({ ...prev, endDate: e.target.value }))}
+                      className="w-full bg-white/5 border border-white/10 rounded-lg px-2 py-1.5 text-[10px] focus:outline-none focus:border-[#ff4e00]/50 transition-all"
+                    />
+                  </div>
+                </div>
+
+                <div className="relative">
+                  <Users className="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 opacity-40" />
+                  <select 
+                    value={historyFilters.agentRole}
+                    onChange={(e) => setHistoryFilters(prev => ({ ...prev, agentRole: e.target.value }))}
+                    className="w-full bg-white/5 border border-white/10 rounded-lg pl-9 pr-4 py-2 text-xs focus:outline-none focus:border-[#ff4e00]/50 transition-all appearance-none cursor-pointer"
+                  >
+                    <option value="" className="bg-[#150d0a]">{t.allRoles}</option>
+                    {allRoles.map(role => (
+                      <option key={role} value={role} className="bg-[#150d0a]">{role}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {(historyFilters.query || historyFilters.startDate || historyFilters.endDate || historyFilters.agentRole) && (
+                  <button 
+                    onClick={() => setHistoryFilters({ query: '', startDate: '', endDate: '', agentRole: '' })}
+                    className="text-[9px] uppercase tracking-widest text-[#ff4e00] hover:underline w-full text-center"
+                  >
+                    {t.clearFilters}
+                  </button>
+                )}
+              </div>
+
               <div className="flex-1 overflow-y-auto space-y-4 pr-2">
-                {state.history.length === 0 ? (
-                  <div className="text-center py-12 opacity-30 italic text-sm">No foresight history yet.</div>
+                {filteredHistory.length === 0 ? (
+                  <div className="text-center py-12 opacity-30 italic text-sm">
+                    {state.history.length === 0 ? t.noHistory : t.noMatches}
+                  </div>
                 ) : (
-                  state.history.map((item) => (
+                  filteredHistory.map((item) => (
                     <div 
                       key={item.id}
                       onClick={() => loadFromHistory(item)}
@@ -249,7 +635,22 @@ Generated by MiroFish Systems
                     >
                       <div className="text-xs opacity-40 mb-2">{new Date(item.timestamp).toLocaleDateString()}</div>
                       <div className="text-sm font-medium line-clamp-2 italic font-serif">"{item.question}"</div>
-                      <div className="flex gap-2 mt-2">
+                      <div className="flex -space-x-1.5 mt-3">
+                        {item.agents.map((agent, i) => (
+                          <div key={i} className="relative group/agent">
+                            <img 
+                              src={agent.avatar} 
+                              alt={agent.name}
+                              className="w-5 h-5 rounded-full border-2 border-[#150d0a] bg-white/10"
+                              referrerPolicy="no-referrer"
+                            />
+                            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 bg-black text-[8px] rounded whitespace-nowrap opacity-0 group-hover/agent:opacity-100 transition-opacity z-10 pointer-events-none border border-white/10">
+                              {agent.name} (Rep: {agent.reputation})
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex gap-2 mt-3">
                         <button 
                           onClick={(e) => {
                             e.stopPropagation();
@@ -277,30 +678,137 @@ Generated by MiroFish Systems
         )}
       </AnimatePresence>
 
-      <main className="relative z-10 max-w-5xl mx-auto px-6 py-12 min-h-screen flex flex-col">
-        {/* Header */}
-        <header className="flex items-center justify-between mb-16">
-          <div className="flex items-center gap-3 group cursor-pointer" onClick={reset}>
-            <div className="w-10 h-10 bg-[#ff4e00] rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(255,78,0,0.4)] group-hover:scale-110 transition-transform">
-              <Fish className="text-white w-6 h-6" />
-            </div>
-            <h1 className="text-2xl font-bold tracking-tighter uppercase italic">MiroFish</h1>
+      {/* Avatar Customization Modal */}
+      <AnimatePresence>
+        {isCustomizingAgent && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-6">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsCustomizingAgent(null)}
+              className="absolute inset-0 bg-black/80 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative w-full max-w-md bg-[#1a1412] border border-white/10 rounded-3xl p-6 md:p-8 shadow-2xl"
+            >
+              <div className="flex items-center justify-between mb-8">
+                <h3 className="text-xl font-bold tracking-tight">{t.customizeAvatar}</h3>
+                <button 
+                  onClick={() => setIsCustomizingAgent(null)}
+                  className="p-2 hover:bg-white/5 rounded-full transition-colors"
+                >
+                  <ArrowRight className="w-5 h-5 rotate-180" />
+                </button>
+              </div>
+
+              {state.agents.find(a => a.id === isCustomizingAgent) && (
+                <div className="flex flex-col items-center gap-8">
+                  <div 
+                    className="w-32 h-32 rounded-full overflow-hidden border-4 shadow-2xl relative"
+                    style={{ borderColor: state.agents.find(a => a.id === isCustomizingAgent)?.color }}
+                  >
+                    {isGeneratingAvatar ? (
+                      <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
+                        <RefreshCcw className="w-8 h-8 animate-spin text-[#ff4e00]" />
+                      </div>
+                    ) : null}
+                    <img 
+                      src={state.agents.find(a => a.id === isCustomizingAgent)?.avatar} 
+                      alt="Preview" 
+                      className="w-full h-full object-cover"
+                      referrerPolicy="no-referrer"
+                    />
+                  </div>
+
+                  <div className="w-full space-y-6">
+                    <div className="space-y-2">
+                      <div className="text-[10px] uppercase tracking-widest opacity-40">{t.customPrompt || 'Custom Style Prompt (Optional)'}</div>
+                      <input
+                        type="text"
+                        value={customAvatarPrompt}
+                        onChange={(e) => setCustomAvatarPrompt(e.target.value)}
+                        placeholder="e.g. Cyberpunk, 8-bit, oil painting..."
+                        className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#ff4e00]/50 transition-all"
+                      />
+                    </div>
+
+                    <button
+                      onClick={() => handleRegenerateAvatar(isCustomizingAgent)}
+                      disabled={isGeneratingAvatar}
+                      className="w-full py-4 bg-[#ff4e00] text-white rounded-2xl font-bold flex items-center justify-center gap-3 hover:bg-[#ff6a26] transition-all disabled:opacity-50"
+                    >
+                      <Sparkles className="w-5 h-5" />
+                      {isGeneratingAvatar ? t.generatingAI : t.generateNewAI}
+                    </button>
+
+                    <div className="space-y-3">
+                      <div className="text-xs uppercase tracking-widest opacity-40 text-center">{t.selectStyle}</div>
+                      <div className="grid grid-cols-3 gap-2 max-h-40 overflow-y-auto pr-1 custom-scrollbar">
+                        {PREMADE_AVATAR_STYLES.map(style => (
+                          <button
+                            key={style.value}
+                            onClick={() => handleSelectPremadeAvatar(isCustomizingAgent, style.value)}
+                            className="py-2 px-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-[10px] uppercase tracking-wider transition-colors"
+                          >
+                            {style.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </motion.div>
           </div>
-          <div className="flex items-center gap-6">
+        )}
+      </AnimatePresence>
+
+      <main className="relative z-10 max-w-5xl mx-auto px-4 md:px-6 py-8 md:py-12 min-h-screen flex flex-col">
+        {/* Header */}
+        <header className="flex items-center justify-between mb-8 md:mb-16">
+          <div className="flex items-center gap-3 group cursor-pointer" onClick={reset}>
+            <div className="w-8 h-8 md:w-10 md:h-10 bg-[#ff4e00] rounded-xl flex items-center justify-center shadow-[0_0_20px_rgba(255,78,0,0.4)] group-hover:scale-110 transition-transform">
+              <Fish className="text-white w-5 h-5 md:w-6 md:h-6" />
+            </div>
+            <h1 className="text-xl md:text-2xl font-bold tracking-tighter uppercase italic">MiroFish</h1>
+          </div>
+          <div className="flex items-center gap-4 md:gap-6">
+            {user ? (
+              <div className="flex items-center gap-3">
+                <div className="hidden sm:flex flex-col items-end">
+                  <span className="text-[10px] font-bold opacity-80">{user.displayName}</span>
+                  <button onClick={signOut} className="text-[8px] uppercase tracking-widest opacity-40 hover:opacity-100 transition-opacity">
+                    {t.signOut || 'Sign Out'}
+                  </button>
+                </div>
+                <img src={user.photoURL || ''} alt="User" className="w-8 h-8 rounded-full border border-white/10" referrerPolicy="no-referrer" />
+              </div>
+            ) : (
+              <button 
+                onClick={signIn}
+                className="text-[10px] md:text-xs uppercase tracking-[0.2em] opacity-40 hover:opacity-100 flex items-center gap-2 transition-opacity"
+              >
+                <Users className="w-4 h-4" /> {t.signIn || 'Sign In'}
+              </button>
+            )}
             <button 
               onClick={() => setIsHistoryOpen(true)}
-              className="text-xs uppercase tracking-[0.2em] opacity-40 hover:opacity-100 flex items-center gap-2 transition-opacity"
+              className="text-[10px] md:text-xs uppercase tracking-[0.2em] opacity-40 hover:opacity-100 flex items-center gap-2 transition-opacity"
             >
-              <History className="w-4 h-4" /> History
+              <History className="w-4 h-4" /> <span className="hidden sm:inline">{t.history}</span>
             </button>
-            <div className="text-xs uppercase tracking-[0.2em] opacity-40 font-mono hidden md:block">
-              {state.status === 'idle' ? 'System Ready' : `Status: ${state.status}`}
+            <div className="text-[10px] md:text-xs uppercase tracking-[0.2em] opacity-40 font-mono hidden md:block">
+              {state.status === 'idle' ? t.systemReady : `${t.status}: ${state.status}`}
             </div>
           </div>
         </header>
 
         <AnimatePresence mode="wait">
-          {state.status === 'idle' && (
+          {state.status === 'idle' && !sessionId && (
             <motion.div
               key="idle"
               initial={{ opacity: 0, y: 20 }}
@@ -308,22 +816,21 @@ Generated by MiroFish Systems
               exit={{ opacity: 0, y: -20 }}
               className="flex-1 flex flex-col justify-center items-center text-center"
             >
-              <h2 className="text-5xl md:text-7xl font-light leading-tight mb-8 tracking-tight">
-                Gain <span className="italic font-serif text-[#ff4e00]">foresight</span> in a <br />
-                world of noise.
+              <h2 className="text-4xl md:text-7xl font-light leading-tight mb-6 md:mb-8 tracking-tight">
+                {t.heroTitle}
               </h2>
-              <p className="max-w-xl text-lg opacity-60 mb-12 leading-relaxed">
-                Feed in your data or a pressing question. Watch as a digital society springs to life to reveal hidden truths before they happen.
+              <p className="max-w-xl text-base md:text-lg opacity-60 mb-8 md:mb-12 leading-relaxed px-4">
+                {t.heroSubtitle}
               </p>
 
-              <div className="w-full max-w-2xl flex flex-col gap-4">
+              <div className="w-full max-w-2xl flex flex-col gap-4 px-4">
                 <div className="flex items-center justify-center gap-4 mb-2">
                   <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-full px-4 py-2">
                     <Globe className="w-4 h-4 text-[#ff4e00]" />
                     <select 
                       value={state.language}
                       onChange={(e) => setState(prev => ({ ...prev, language: e.target.value }))}
-                      className="bg-transparent text-xs uppercase tracking-widest font-bold focus:outline-none cursor-pointer"
+                      className="bg-transparent text-[10px] md:text-xs uppercase tracking-widest font-bold focus:outline-none cursor-pointer"
                     >
                       {LANGUAGES.map(lang => (
                         <option key={lang.value} value={lang.value} className="bg-[#150d0a]">{lang.label}</option>
@@ -337,24 +844,71 @@ Generated by MiroFish Systems
                     type="text"
                     value={state.question}
                     onChange={(e) => setState(prev => ({ ...prev, question: e.target.value }))}
-                    placeholder="What is the future of..."
-                    className="w-full bg-white/5 border border-white/10 rounded-2xl px-8 py-6 text-xl focus:outline-none focus:border-[#ff4e00]/50 focus:bg-white/10 transition-all pr-20 shadow-2xl backdrop-blur-xl"
+                    placeholder={isListening ? t.listening : t.placeholder}
+                    className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 md:px-8 py-5 md:py-6 text-lg md:text-xl focus:outline-none focus:border-[#ff4e00]/50 focus:bg-white/10 transition-all pr-28 md:pr-36 shadow-2xl backdrop-blur-xl"
                   />
-                  <button
-                    type="submit"
-                    disabled={!state.question.trim()}
-                    className="absolute right-3 top-3 bottom-3 px-6 bg-[#ff4e00] text-white rounded-xl flex items-center justify-center hover:bg-[#ff6a26] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    <ArrowRight className="w-6 h-6" />
-                  </button>
+                  <div className="absolute right-2 top-2 bottom-2 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={toggleListening}
+                      className={`px-3 md:px-4 rounded-xl flex items-center justify-center transition-all ${isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-white/5 text-white/40 hover:bg-white/10 hover:text-white'}`}
+                      title="Speak to Text"
+                    >
+                      {isListening ? <MicOff className="w-5 h-5 md:w-6 md:h-6" /> : <Mic className="w-5 h-5 md:w-6 md:h-6" />}
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={!state.question.trim()}
+                      className="px-4 md:px-6 bg-[#ff4e00] text-white rounded-xl flex items-center justify-center hover:bg-[#ff6a26] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      <ArrowRight className="w-5 h-5 md:w-6 md:h-6" />
+                    </button>
+                  </div>
                 </form>
               </div>
               
-              <div className="mt-12 flex gap-8 text-xs uppercase tracking-widest opacity-30">
-                <div className="flex items-center gap-2"><Users className="w-4 h-4" /> 1000+ Analysts</div>
-                <div className="flex items-center gap-2"><TrendingUp className="w-4 h-4" /> Market Synthesis</div>
-                <div className="flex items-center gap-2"><Sparkles className="w-4 h-4" /> AI Foresight</div>
+              <div className="mt-12 flex flex-wrap justify-center gap-4 md:gap-8 text-[10px] md:text-xs uppercase tracking-widest opacity-30">
+                <div className="flex items-center gap-2"><Users className="w-4 h-4" /> {t.analysts}</div>
+                <div className="flex items-center gap-2"><TrendingUp className="w-4 h-4" /> {t.marketSynthesis}</div>
+                <div className="flex items-center gap-2"><Sparkles className="w-4 h-4" /> {t.aiForesight}</div>
               </div>
+            </motion.div>
+          )}
+
+          {state.status === 'idle' && sessionId && !user && (
+            <motion.div
+              key="auth-required"
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="flex-1 flex flex-col justify-center items-center text-center"
+            >
+              <div className="w-20 h-20 bg-white/5 rounded-3xl flex items-center justify-center mb-8 border border-white/10">
+                <Users className="w-10 h-10 text-[#ff4e00]" />
+              </div>
+              <h2 className="text-3xl font-bold mb-4">Collaboration Required</h2>
+              <p className="max-w-md opacity-60 mb-8">
+                You've been invited to a MiroFish foresight session. Please sign in to join the digital society.
+              </p>
+              <button
+                onClick={signIn}
+                className="px-8 py-4 bg-[#ff4e00] text-white rounded-2xl font-bold hover:bg-[#ff6a26] transition-all flex items-center gap-3 shadow-2xl"
+              >
+                <Users className="w-5 h-5" />
+                Sign In with Google
+              </button>
+            </motion.div>
+          )}
+
+          {state.status === 'idle' && sessionId && user && (
+            <motion.div
+              key="loading-session"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="flex-1 flex flex-col justify-center items-center"
+            >
+              <RefreshCcw className="w-12 h-12 animate-spin text-[#ff4e00] mb-4" />
+              <p className="opacity-40 uppercase tracking-widest text-xs">Joining Session...</p>
             </motion.div>
           )}
 
@@ -366,25 +920,28 @@ Generated by MiroFish Systems
               className="flex-1 flex flex-col gap-8"
             >
               {/* Simulation Header */}
-              <div className="bg-white/5 border border-white/10 rounded-3xl p-8 backdrop-blur-md">
-                <div className="flex items-center justify-between mb-4">
+              <div className="bg-white/5 border border-white/10 rounded-3xl p-6 md:p-8 backdrop-blur-md">
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-4">
                   <div className="flex items-center gap-3">
-                    <span className="text-xs uppercase tracking-widest text-[#ff4e00] font-bold">Inquiry</span>
+                    <span className="text-xs uppercase tracking-widest text-[#ff4e00] font-bold">{t.inquiry}</span>
                     <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded-full opacity-60">{state.language}</span>
                   </div>
                   <div className="flex items-center gap-4">
+                    <button onClick={shareSession} className="text-xs opacity-40 hover:opacity-100 flex items-center gap-1 transition-opacity">
+                      <Share2 className="w-3 h-3" /> {copied ? t.copied : t.share}
+                    </button>
                     <button onClick={reset} className="text-xs opacity-40 hover:opacity-100 flex items-center gap-1 transition-opacity">
-                      <RefreshCcw className="w-3 h-3" /> New Inquiry
+                      <RefreshCcw className="w-3 h-3" /> {t.newInquiry}
                     </button>
                   </div>
                 </div>
-                <h3 className="text-2xl font-medium italic font-serif">"{state.question}"</h3>
+                <h3 className="text-xl md:text-2xl font-medium italic font-serif">"{state.question}"</h3>
               </div>
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 flex-1">
                 {/* Agents List */}
                 <div className="lg:col-span-1 flex flex-col gap-4">
-                  <h4 className="text-xs uppercase tracking-widest opacity-40 mb-2">Digital Society</h4>
+                  <h4 className="text-xs uppercase tracking-widest opacity-40 mb-2">{t.digitalSociety}</h4>
                   {state.agents.length === 0 ? (
                     <div className="flex flex-col gap-4">
                       {[1, 2, 3, 4, 5].map(i => (
@@ -400,38 +957,54 @@ Generated by MiroFish Systems
                         className="bg-white/5 border border-white/5 p-4 rounded-2xl flex items-center gap-4 group hover:bg-white/10 transition-colors"
                       >
                         <div 
-                          className="w-10 h-10 rounded-full flex-shrink-0 overflow-hidden border-2"
+                          className="w-10 h-10 rounded-full flex-shrink-0 overflow-hidden border-2 cursor-pointer hover:scale-110 transition-transform relative group/avatar"
                           style={{ borderColor: agent.color }}
+                          onClick={() => setIsCustomizingAgent(agent.id)}
                         >
-                          <img src={agent.avatar} alt={agent.name} referrerPolicy="no-referrer" />
+                          <img src={agent.avatar} alt={agent.name} referrerPolicy="no-referrer" className="w-full h-full object-cover" />
+                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/avatar:opacity-100 flex items-center justify-center transition-opacity">
+                            <Sparkles className="w-4 h-4 text-white" />
+                          </div>
                         </div>
-                        <div>
-                          <div className="font-bold text-sm">{agent.name}</div>
-                          <div className="text-[10px] uppercase tracking-wider opacity-40">{agent.role}</div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <div className="font-bold text-sm truncate">{agent.name}</div>
+                            <div className="text-[9px] bg-white/10 px-1.5 py-0.5 rounded-md opacity-60 flex items-center gap-1">
+                              <TrendingUp className="w-2 h-2" /> {agent.reputation}
+                            </div>
+                          </div>
+                          <div className="text-[10px] uppercase tracking-wider opacity-40 truncate">{agent.role}</div>
                         </div>
+                        <button 
+                          onClick={() => setIsCustomizingAgent(agent.id)}
+                          className="p-1.5 opacity-0 group-hover:opacity-40 hover:opacity-100 transition-opacity"
+                          title="Customize Avatar"
+                        >
+                          <Sparkles className="w-3 h-3" />
+                        </button>
                       </motion.div>
                     ))
                   )}
                 </div>
 
                 {/* Debate Feed */}
-                <div className="lg:col-span-2 flex flex-col gap-4 bg-white/[0.02] border border-white/5 rounded-3xl p-6 h-[500px] overflow-y-auto scrollbar-hide relative">
-                  <h4 className="text-xs uppercase tracking-widest opacity-40 mb-2 sticky top-0 bg-[#0a0502]/80 backdrop-blur-sm py-2 z-10 flex justify-between items-center">
-                    <span>Live Synthesis (Argue)</span>
+                <div className="lg:col-span-2 flex flex-col gap-4 bg-white/[0.02] border border-white/5 rounded-3xl p-4 md:p-6 h-[400px] md:h-[500px] overflow-y-auto scrollbar-hide relative">
+                  <h4 className="text-[10px] md:text-xs uppercase tracking-widest opacity-40 mb-2 sticky top-0 bg-[#0a0502]/80 backdrop-blur-sm py-2 z-10 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2">
+                    <span>{t.liveSynthesis}</span>
                     {state.status === 'completed' && (
                       <div className="flex gap-4">
                         <button 
                           onClick={() => exportToTxt(state.question, state.agents, state.messages, state.synthesis || '')}
                           className="flex items-center gap-2 hover:text-[#ff4e00] transition-colors"
                         >
-                          <Download className="w-3 h-3" /> Export TXT
+                          <Download className="w-3 h-3" /> <span className="hidden sm:inline">{t.exportTxt}</span>
                         </button>
                         <button 
                           onClick={copyToClipboard}
                           className="flex items-center gap-2 hover:text-[#ff4e00] transition-colors"
                         >
                           {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                          {copied ? 'Copied' : 'Copy Debate'}
+                          {copied ? t.copied : <span className="hidden sm:inline">{t.copyDebate}</span>}
                         </button>
                       </div>
                     )}
@@ -478,7 +1051,7 @@ Generated by MiroFish Systems
                         className="flex flex-col items-center justify-center py-12 text-center gap-4"
                       >
                         <div className="w-12 h-12 border-2 border-[#ff4e00] border-t-transparent rounded-full animate-spin" />
-                        <div className="text-sm italic font-serif opacity-60">Synthesizing hidden truths...</div>
+                        <div className="text-sm italic font-serif opacity-60">{t.synthesizing}</div>
                       </motion.div>
                     )}
 
@@ -486,44 +1059,38 @@ Generated by MiroFish Systems
                       <motion.div
                         initial={{ opacity: 0, scale: 0.95 }}
                         animate={{ opacity: 1, scale: 1 }}
-                        className="mt-8 bg-[#ff4e00] text-white p-8 rounded-3xl shadow-2xl relative overflow-hidden group"
+                        className="mt-8 bg-[#ff4e00] text-white p-6 md:p-8 rounded-3xl shadow-2xl relative overflow-hidden group"
                       >
                         <div className="absolute top-0 right-0 p-4 opacity-20 group-hover:rotate-12 transition-transform">
-                          <Sparkles className="w-12 h-12" />
+                          <Sparkles className="w-8 h-8 md:w-12 md:h-12" />
                         </div>
                         <div className="flex justify-between items-start mb-4">
-                          <h5 className="text-xs uppercase tracking-[0.3em] font-bold opacity-80">Final Foresight</h5>
+                          <h5 className="text-[10px] md:text-xs uppercase tracking-[0.3em] font-bold opacity-80">{t.finalForesight}</h5>
                           <div className="flex gap-2">
                             <button 
                               onClick={() => exportToTxt(state.question, state.agents, state.messages, state.synthesis || '')}
                               className="p-2 bg-black/20 hover:bg-black/40 rounded-lg transition-colors"
-                              title="Export to TXT"
+                              title={t.exportTxt}
                             >
                               <Download className="w-4 h-4" />
                             </button>
                             <button 
                               onClick={copyToClipboard}
                               className="p-2 bg-black/20 hover:bg-black/40 rounded-lg transition-colors"
-                              title="Copy Foresight"
+                              title={t.copyDebate}
                             >
                               {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
                             </button>
-                            <button 
-                              className="p-2 bg-black/20 hover:bg-black/40 rounded-lg transition-colors"
-                              title="Post/Share"
-                            >
-                              <Share2 className="w-4 h-4" />
-                            </button>
                           </div>
                         </div>
-                        <div className="text-xl md:text-2xl font-serif italic leading-snug">
+                        <div className="text-lg md:text-2xl font-serif italic leading-snug">
                           {state.synthesis}
                         </div>
                         <button 
                           onClick={reset}
-                          className="mt-8 flex items-center gap-2 text-xs uppercase tracking-widest font-bold bg-black/20 hover:bg-black/40 px-4 py-2 rounded-full transition-colors"
+                          className="mt-8 flex items-center gap-2 text-[10px] md:text-xs uppercase tracking-widest font-bold bg-black/20 hover:bg-black/40 px-4 py-2 rounded-full transition-colors"
                         >
-                          New Simulation <ChevronRight className="w-4 h-4" />
+                          {t.newSimulation} <ChevronRight className="w-4 h-4" />
                         </button>
                       </motion.div>
                     )}
@@ -544,13 +1111,13 @@ Generated by MiroFish Systems
               <div className="w-16 h-16 bg-red-500/20 text-red-500 rounded-full flex items-center justify-center mb-6">
                 <AlertCircle className="w-8 h-8" />
               </div>
-              <h3 className="text-2xl font-bold mb-4">Simulation Disrupted</h3>
+              <h3 className="text-2xl font-bold mb-4">{t.simulationDisrupted}</h3>
               <p className="opacity-60 mb-8 max-w-md">{state.error}</p>
               <button
                 onClick={reset}
                 className="px-8 py-3 bg-white/10 hover:bg-white/20 rounded-xl transition-colors uppercase tracking-widest text-xs font-bold"
               >
-                Try Again
+                {t.tryAgain}
               </button>
             </motion.div>
           )}
@@ -560,12 +1127,13 @@ Generated by MiroFish Systems
         <footer className="mt-16 pt-8 border-t border-white/5 flex flex-col md:flex-row items-center justify-between gap-4 text-[10px] uppercase tracking-widest opacity-30 font-mono">
           <div>&copy; 2026 MiroFish Systems</div>
           <div className="flex gap-6">
-            <a href="#" className="hover:opacity-100 transition-opacity">Protocol</a>
-            <a href="#" className="hover:opacity-100 transition-opacity">Neural Grid</a>
-            <a href="#" className="hover:opacity-100 transition-opacity">Privacy</a>
+            <a href="#" className="hover:opacity-100 transition-opacity">{t.protocol}</a>
+            <a href="#" className="hover:opacity-100 transition-opacity">{t.neuralGrid}</a>
+            <a href="#" className="hover:opacity-100 transition-opacity">{t.privacy}</a>
           </div>
         </footer>
       </main>
     </div>
+    </ErrorBoundary>
   );
 }

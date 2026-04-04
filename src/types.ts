@@ -4,6 +4,7 @@ export interface Agent {
   role: string;
   avatar: string;
   color: string;
+  reputation: number;
 }
 
 export interface Message {
