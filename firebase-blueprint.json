@@ -8,11 +8,12 @@
         "id": { "type": "string" },
         "name": { "type": "string" },
         "role": { "type": "string" },
+        "background": { "type": "string" },
         "avatar": { "type": "string" },
         "color": { "type": "string" },
         "reputation": { "type": "number" }
       },
-      "required": ["id", "name", "role", "avatar", "color", "reputation"]
+      "required": ["id", "name", "role", "background", "avatar", "color", "reputation"]
     },
     "Message": {
       "title": "Message",
@@ -43,12 +44,49 @@
         "createdBy": { "type": "string" }
       },
       "required": ["question", "language", "status", "agents", "messages", "timestamp", "lastUpdated"]
+    },
+    "Presence": {
+      "title": "Presence",
+      "description": "User presence in a simulation",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "lastSeen": { "type": "number" }
+      },
+      "required": ["uid", "displayName", "photoURL", "lastSeen"]
+    },
+    "User": {
+      "title": "User",
+      "description": "User profile and payment status",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "hasPaid": { "type": "boolean" },
+        "paymentDate": { "type": "number" },
+        "subscriptionId": { "type": "string" },
+        "subscriptionStatus": { "type": "string" },
+        "plan": { "type": "string", "enum": ["monthly", "annual", "one-time"] },
+        "expiryDate": { "type": "number" }
+      },
+      "required": ["uid", "email", "hasPaid"]
     }
   },
   "firestore": {
     "/simulations/{simulationId}": {
       "schema": "Simulation",
       "description": "Shared simulation sessions for real-time collaboration"
+    },
+    "/simulations/{simulationId}/presence/{userId}": {
+      "schema": "Presence",
+      "description": "Real-time presence tracking for collaborators"
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles and payment status"
     }
   }
 }

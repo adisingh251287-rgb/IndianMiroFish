@@ -20,13 +20,14 @@ import {
   Download,
   Globe,
   Mic,
-  MicOff
+  MicOff,
+  Target
 } from 'lucide-react';
-import { Agent, Message, SimulationState, HistoryItem } from './types';
-import { generateAgents, simulateDebate, synthesizeForesight, generateAvatar } from './services/gemini';
+import { Agent, Message, SimulationState, HistoryItem, ValidationData } from './types';
+import { generateAgents, simulateDebate, synthesizeForesight, generateAvatar, validateForesight } from './services/gemini';
 import { TRANSLATIONS } from './translations';
 import { db, auth, signIn, signOut, handleFirestoreError, OperationType } from './firebase';
-import { doc, onSnapshot, setDoc, updateDoc, collection } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, updateDoc, collection, getDocs, query, where, orderBy, limit } from 'firebase/firestore';
 import { onAuthStateChanged, User } from 'firebase/auth';
 
 class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: any }> {
@@ -103,6 +104,16 @@ const LANGUAGES = [
   { label: 'German', value: 'German', code: 'de-DE' },
 ];
 
+import { SocietalHeatmap } from './components/SocietalHeatmap';
+import { AccuracyDashboard } from './components/AccuracyDashboard';
+import { BarChart2, CheckCircle2, Info } from 'lucide-react';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+
 export default function App() {
   const [state, setState] = useState<SimulationState>({
     status: 'idle',
@@ -118,10 +129,19 @@ export default function App() {
   const [isGeneratingAvatar, setIsGeneratingAvatar] = useState(false);
   const [customAvatarPrompt, setCustomAvatarPrompt] = useState('');
   const [copied, setCopied] = useState(false);
+  const [presence, setPresence] = useState<{ uid: string, displayName: string, photoURL: string }[]>([]);
   const [isListening, setIsListening] = useState(false);
   const [agentReputations, setAgentReputations] = useState<Record<string, number>>({});
   const [user, setUser] = useState<User | null>(null);
+  const [hasPaid, setHasPaid] = useState<boolean | null>(null);
+  const [isCheckingOut, setIsCheckingOut] = useState(false);
+  const [showConfigError, setShowConfigError] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(window.location.hash.slice(1) || null);
+  const [activeTab, setActiveTab] = useState<'simulation' | 'dashboard'>('simulation');
+  const [isValidationModalOpen, setIsValidationModalOpen] = useState(false);
+  const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
+  const [validationInput, setValidationInput] = useState('');
+  const [isValidating, setIsValidating] = useState(false);
   const [historyFilters, setHistoryFilters] = useState({
     query: '',
     startDate: '',
@@ -130,10 +150,32 @@ export default function App() {
   });
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Auth listener
+  // Auth listener and payment status
   useEffect(() => {
     return onAuthStateChanged(auth, (u) => {
       setUser(u);
+      if (u) {
+        // Fetch payment status
+        const userDoc = doc(db, 'users', u.uid);
+        const unsubscribe = onSnapshot(userDoc, (snapshot) => {
+          if (snapshot.exists()) {
+            setHasPaid(snapshot.data().hasPaid || false);
+          } else {
+            // Create initial user doc
+            setDoc(userDoc, {
+              uid: u.uid,
+              email: u.email,
+              displayName: u.displayName,
+              hasPaid: false,
+              createdAt: Date.now()
+            }, { merge: true });
+            setHasPaid(false);
+          }
+        });
+        return () => unsubscribe();
+      } else {
+        setHasPaid(null);
+      }
     });
   }, []);
 
@@ -144,6 +186,21 @@ export default function App() {
     };
     window.addEventListener('hashchange', handleHashChange);
     return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  // Handle payment success/cancel from URL
+  useEffect(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const paymentStatus = urlParams.get('payment');
+    if (paymentStatus === 'success') {
+      // We could show a toast here
+      console.log('Payment successful!');
+      // Clean up URL
+      window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+    } else if (paymentStatus === 'cancel') {
+      console.log('Payment cancelled.');
+      window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+    }
   }, []);
 
   // Real-time sync for shared session
@@ -160,12 +217,25 @@ export default function App() {
           if (prev.status === 'simulating' && data.status === 'simulating' && data.messages.length <= prev.messages.length) {
             return prev;
           }
+
+          // Merge agents to avoid overwriting local edits
+          let mergedAgents = data.agents;
+          if (editingAgentId) {
+            mergedAgents = data.agents.map((remoteAgent: Agent) => {
+              if (remoteAgent.id === editingAgentId) {
+                const localAgent = prev.agents.find(a => a.id === editingAgentId);
+                return localAgent || remoteAgent;
+              }
+              return remoteAgent;
+            });
+          }
+
           return {
             ...prev,
             question: data.question,
             language: data.language,
             status: data.status,
-            agents: data.agents,
+            agents: mergedAgents,
             messages: data.messages,
             synthesis: data.synthesis,
             error: data.error
@@ -176,7 +246,31 @@ export default function App() {
       handleFirestoreError(error, OperationType.GET, path);
     });
 
-    return () => unsubscribe();
+    // Presence tracking
+    const presenceRef = doc(db, `simulations/${sessionId}/presence`, user.uid);
+    setDoc(presenceRef, {
+      uid: user.uid,
+      displayName: user.displayName,
+      photoURL: user.photoURL,
+      lastSeen: Date.now()
+    }, { merge: true });
+
+    const presenceUnsubscribe = onSnapshot(collection(db, `simulations/${sessionId}/presence`), (snapshot) => {
+      const activeUsers = snapshot.docs
+        .map(d => d.data() as any)
+        .filter(u => Date.now() - u.lastSeen < 60000); // Only show users active in last minute
+      setPresence(activeUsers);
+    });
+
+    const heartbeat = setInterval(() => {
+      updateDoc(presenceRef, { lastSeen: Date.now() });
+    }, 30000);
+
+    return () => {
+      unsubscribe();
+      presenceUnsubscribe();
+      clearInterval(heartbeat);
+    };
   }, [sessionId, user]);
 
   // Load history, reputations, and draft question from localStorage
@@ -242,10 +336,21 @@ export default function App() {
     setIsGeneratingAvatar(true);
     try {
       const newAvatar = await generateAvatar(agent.role, agent.name, customAvatarPrompt);
+      const updatedAgents = state.agents.map(a => a.id === agentId ? { ...a, avatar: newAvatar } : a);
+      
       setState(prev => ({
         ...prev,
-        agents: prev.agents.map(a => a.id === agentId ? { ...a, avatar: newAvatar } : a)
+        agents: updatedAgents
       }));
+
+      // Sync to Firestore if in a session
+      if (sessionId) {
+        await updateDoc(doc(db, 'simulations', sessionId), {
+          agents: updatedAgents,
+          lastUpdated: Date.now()
+        });
+      }
+
       setCustomAvatarPrompt(''); // Reset prompt after generation
     } catch (error) {
       console.error(error);
@@ -259,10 +364,20 @@ export default function App() {
     if (!agent) return;
 
     const newAvatar = `https://api.dicebear.com/7.x/${style}/svg?seed=${agent.name}-${Date.now()}`;
+    const updatedAgents = state.agents.map(a => a.id === agentId ? { ...a, avatar: newAvatar } : a);
+    
     setState(prev => ({
       ...prev,
-      agents: prev.agents.map(a => a.id === agentId ? { ...a, avatar: newAvatar } : a)
+      agents: updatedAgents
     }));
+
+    // Sync to Firestore if in a session
+    if (sessionId) {
+      updateDoc(doc(db, 'simulations', sessionId), {
+        agents: updatedAgents,
+        lastUpdated: Date.now()
+      });
+    }
   };
 
   const filteredHistory = state.history.filter(item => {
@@ -351,6 +466,39 @@ Generated by MiroFish Systems
     URL.revokeObjectURL(url);
   };
 
+  const handleCheckout = async (plan: 'monthly' | 'annual' | 'one-time' = 'one-time') => {
+    if (!user) return;
+    setIsCheckingOut(true);
+    try {
+      const response = await fetch('/api/create-checkout-session', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          userId: user.uid,
+          email: user.email,
+          plan: plan
+        }),
+      });
+      const data = await response.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        throw new Error(data.error || 'Failed to create checkout session');
+      }
+    } catch (error: any) {
+      console.error('Checkout error:', error);
+      if (error.message.includes('STRIPE_SECRET_KEY')) {
+        setShowConfigError(true);
+      } else {
+        alert('Failed to start checkout. Please try again.');
+      }
+    } finally {
+      setIsCheckingOut(false);
+    }
+  };
+
   const handleStartSimulation = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!state.question.trim()) return;
@@ -358,16 +506,19 @@ Generated by MiroFish Systems
     if (!user) {
       try {
         await signIn();
-        return; // Stop here, user needs to click again after sign in or we can continue
+        return;
       } catch (error) {
         console.error("Sign in failed", error);
         return;
       }
     }
 
-    const newSessionId = Date.now().toString();
-    setSessionId(newSessionId);
-    window.location.hash = newSessionId;
+    let targetSessionId = sessionId;
+    if (!targetSessionId || state.status === 'completed') {
+      targetSessionId = Date.now().toString();
+      setSessionId(targetSessionId);
+      window.location.hash = targetSessionId;
+    }
 
     const initialState: any = {
       question: state.question,
@@ -380,11 +531,11 @@ Generated by MiroFish Systems
       createdBy: user.uid
     };
 
-    const path = `simulations/${newSessionId}`;
+    const path = `simulations/${targetSessionId}`;
     try {
-      await setDoc(doc(db, 'simulations', newSessionId), initialState);
+      await setDoc(doc(db, 'simulations', targetSessionId), initialState);
     } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, path);
+      handleFirestoreError(error, OperationType.WRITE, path);
     }
 
     setState(prev => ({ ...prev, status: 'initializing', agents: [], messages: [], synthesis: undefined }));
@@ -392,20 +543,37 @@ Generated by MiroFish Systems
     try {
       const agents = await generateAgents(state.question, state.language, agentReputations);
       
-      await updateDoc(doc(db, 'simulations', newSessionId), {
-        status: 'simulating',
+      await updateDoc(doc(db, 'simulations', targetSessionId), {
+        status: 'reviewing_agents',
         agents,
         lastUpdated: Date.now()
       });
 
-      setState(prev => ({ ...prev, status: 'simulating', agents }));
+      setState(prev => ({ ...prev, status: 'reviewing_agents', agents }));
+    } catch (error) {
+      console.error(error);
+      setState(prev => ({ ...prev, status: 'error', error: 'The digital society encountered a disruption. Please try again.' }));
+    }
+  };
 
-      const { messages, reputationChanges } = await simulateDebate(state.question, agents, state.language);
+  const handleConfirmAgents = async () => {
+    if (!sessionId || !user) return;
+    
+    setState(prev => ({ ...prev, status: 'simulating' }));
+    
+    try {
+      await updateDoc(doc(db, 'simulations', sessionId), {
+        status: 'simulating',
+        agents: state.agents,
+        lastUpdated: Date.now()
+      });
+
+      const { messages, reputationChanges, impactHeatmap } = await simulateDebate(state.question, state.agents, state.language);
       
       // Update reputations in state
       setAgentReputations(prev => {
         const next = { ...prev };
-        agents.forEach(agent => {
+        state.agents.forEach(agent => {
           const change = reputationChanges[agent.id] || 0;
           next[agent.role] = (next[agent.role] || 100) + change;
         });
@@ -413,13 +581,13 @@ Generated by MiroFish Systems
       });
 
       // Update current agents with new reputations for synthesis and UI
-      const updatedAgents = agents.map(a => ({
+      const updatedAgents = state.agents.map(a => ({
         ...a,
         reputation: a.reputation + (reputationChanges[a.id] || 0)
       }));
 
       // Update state.agents so UI shows new reputation
-      setState(prev => ({ ...prev, agents: updatedAgents }));
+      setState(prev => ({ ...prev, agents: updatedAgents, impactHeatmap }));
 
       // Simulate typing/delay for each message and sync to Firestore
       let currentMessages: Message[] = [];
@@ -427,7 +595,7 @@ Generated by MiroFish Systems
         await new Promise(resolve => setTimeout(resolve, 1500));
         currentMessages = [...currentMessages, messages[i]];
         
-        await updateDoc(doc(db, 'simulations', newSessionId), {
+        await updateDoc(doc(db, 'simulations', sessionId), {
           messages: currentMessages,
           lastUpdated: Date.now()
         });
@@ -439,26 +607,28 @@ Generated by MiroFish Systems
       }
 
       setState(prev => ({ ...prev, status: 'synthesizing' }));
-      await updateDoc(doc(db, 'simulations', newSessionId), {
+      await updateDoc(doc(db, 'simulations', sessionId), {
         status: 'synthesizing',
         lastUpdated: Date.now()
       });
 
-      const synthesis = await synthesizeForesight(state.question, messages, updatedAgents, state.language);
+      const synthesis = await synthesizeForesight(state.question, currentMessages, updatedAgents, state.language);
       
-      await updateDoc(doc(db, 'simulations', newSessionId), {
+      await updateDoc(doc(db, 'simulations', sessionId), {
         status: 'completed',
         synthesis,
         agents: updatedAgents,
+        impactHeatmap,
         lastUpdated: Date.now()
       });
 
       const newHistoryItem: HistoryItem = {
-        id: newSessionId,
+        id: sessionId,
         question: state.question,
         agents: updatedAgents,
-        messages,
+        messages: currentMessages,
         synthesis,
+        impactHeatmap,
         timestamp: Date.now(),
       };
 
@@ -470,11 +640,72 @@ Generated by MiroFish Systems
       }));
 
       // Auto Export
-      exportToTxt(state.question, agents, messages, synthesis);
+      exportToTxt(state.question, updatedAgents, currentMessages, synthesis);
 
     } catch (error) {
       console.error(error);
       setState(prev => ({ ...prev, status: 'error', error: 'The digital society encountered a disruption. Please try again.' }));
+    }
+  };
+
+  const handleValidate = async () => {
+    if (!sessionId || !validationInput || !state.synthesis) return;
+    
+    setIsValidating(true);
+    try {
+      const { accuracyScore, validationReport } = await validateForesight(
+        state.question, 
+        state.synthesis, 
+        validationInput, 
+        state.language
+      );
+
+      const validation: ValidationData = {
+        actualOutcome: validationInput,
+        accuracyScore,
+        validationReport,
+        validatedAt: Date.now()
+      };
+
+      await updateDoc(doc(db, 'simulations', sessionId), {
+        validation,
+        lastUpdated: Date.now()
+      });
+
+      setState(prev => ({
+        ...prev,
+        validation,
+        history: prev.history.map(item => item.id === sessionId ? { ...item, validation } : item)
+      }));
+
+      setIsValidationModalOpen(false);
+      setValidationInput('');
+    } catch (error) {
+      console.error(error);
+    } finally {
+      setIsValidating(false);
+    }
+  };
+
+  const agentSyncTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const handleUpdateAgent = (id: string, updates: Partial<Agent>) => {
+    const updatedAgents = state.agents.map(a => a.id === id ? { ...a, ...updates } : a);
+    setState(prev => ({
+      ...prev,
+      agents: updatedAgents
+    }));
+
+    if (sessionId) {
+      if (agentSyncTimeoutRef.current) {
+        clearTimeout(agentSyncTimeoutRef.current);
+      }
+      agentSyncTimeoutRef.current = setTimeout(() => {
+        updateDoc(doc(db, 'simulations', sessionId), {
+          agents: updatedAgents,
+          lastUpdated: Date.now()
+        }).catch(err => handleFirestoreError(err, OperationType.UPDATE, `simulations/${sessionId}`));
+      }, 1000);
     }
   };
 
@@ -486,6 +717,7 @@ Generated by MiroFish Systems
       agents: item.agents,
       messages: item.messages,
       synthesis: item.synthesis,
+      impactHeatmap: item.impactHeatmap,
     }));
     setIsHistoryOpen(false);
   };
@@ -529,7 +761,8 @@ Generated by MiroFish Systems
 
   return (
     <ErrorBoundary>
-      <div className="min-h-screen bg-[#0a0502] text-[#e0d8d0] font-sans selection:bg-[#ff4e00] selection:text-white overflow-x-hidden">
+      <TooltipProvider>
+        <div className="min-h-screen bg-[#0a0502] text-[#e0d8d0] font-sans selection:bg-[#ff4e00] selection:text-white overflow-x-hidden">
       {/* Dynamic Background */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
         <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-[#3a1510] rounded-full blur-[120px] opacity-30 animate-pulse" />
@@ -651,23 +884,31 @@ Generated by MiroFish Systems
                         ))}
                       </div>
                       <div className="flex gap-2 mt-3">
-                        <button 
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            exportToTxt(item.question, item.agents, item.messages, item.synthesis);
-                          }}
-                          className="p-1.5 bg-white/5 hover:bg-white/20 rounded-lg transition-colors"
-                          title="Export to TXT"
-                        >
-                          <Download className="w-3 h-3" />
-                        </button>
-                        <button 
-                          onClick={(e) => deleteHistoryItem(item.id, e)}
-                          className="p-1.5 bg-white/5 hover:bg-red-500/20 hover:text-red-500 rounded-lg transition-colors"
-                          title="Delete"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
+                        <Tooltip>
+                          <TooltipTrigger 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              exportToTxt(item.question, item.agents, item.messages, item.synthesis);
+                            }}
+                            className="p-1.5 bg-white/5 hover:bg-white/20 rounded-lg transition-colors"
+                          >
+                            <Download className="w-3 h-3" />
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Export this simulation to text</p>
+                          </TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger 
+                            onClick={(e) => deleteHistoryItem(item.id, e)}
+                            className="p-1.5 bg-white/5 hover:bg-red-500/20 hover:text-red-500 rounded-lg transition-colors"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Delete this simulation from history</p>
+                          </TooltipContent>
+                        </Tooltip>
                       </div>
                     </div>
                   ))
@@ -768,6 +1009,41 @@ Generated by MiroFish Systems
       </AnimatePresence>
 
       <main className="relative z-10 max-w-5xl mx-auto px-4 md:px-6 py-8 md:py-12 min-h-screen flex flex-col">
+        {/* Config Error Modal */}
+        {showConfigError && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="max-w-md w-full bg-[#1a1512] border border-white/10 rounded-3xl p-8 shadow-2xl"
+            >
+              <div className="w-16 h-16 bg-amber-500/20 rounded-2xl flex items-center justify-center mb-6">
+                <AlertCircle className="w-8 h-8 text-amber-500" />
+              </div>
+              <h3 className="text-2xl font-bold mb-4">Stripe Setup Required</h3>
+              <p className="text-sm opacity-60 mb-6 leading-relaxed">
+                To enable payments, you need to add your Stripe Secret Key to the environment variables in the **Settings** menu.
+              </p>
+              <div className="bg-white/5 rounded-xl p-4 mb-8 space-y-3">
+                <div className="flex items-center justify-between text-[10px] uppercase tracking-widest font-bold">
+                  <span className="opacity-40">Variable Name</span>
+                  <span className="text-[#ff4e00]">STRIPE_SECRET_KEY</span>
+                </div>
+                <div className="h-px bg-white/10" />
+                <p className="text-[10px] opacity-40 leading-relaxed">
+                  You can find this key in your Stripe Dashboard under Developers &gt; API Keys.
+                </p>
+              </div>
+              <button 
+                onClick={() => setShowConfigError(false)}
+                className="w-full py-4 bg-white/10 hover:bg-white/20 rounded-2xl font-bold transition-all"
+              >
+                Dismiss
+              </button>
+            </motion.div>
+          </div>
+        )}
+
         {/* Header */}
         <header className="flex items-center justify-between mb-8 md:mb-16">
           <div className="flex items-center gap-3 group cursor-pointer" onClick={reset}>
@@ -777,30 +1053,95 @@ Generated by MiroFish Systems
             <h1 className="text-xl md:text-2xl font-bold tracking-tighter uppercase italic">MiroFish</h1>
           </div>
           <div className="flex items-center gap-4 md:gap-6">
+            {presence.length > 1 && (
+              <div className="hidden md:flex items-center -space-x-2 mr-2">
+                {presence.map((u, i) => (
+                  <React.Fragment key={u.uid}>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <div 
+                          className="w-6 h-6 rounded-full border-2 border-[#0a0502] overflow-hidden bg-white/10 cursor-help"
+                          style={{ zIndex: presence.length - i }}
+                        >
+                          <img src={u.photoURL} alt={u.displayName} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>{u.displayName}</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </React.Fragment>
+                ))}
+                <div className="ml-4 text-[8px] uppercase tracking-widest text-[#ff4e00] font-bold animate-pulse">
+                  Live
+                </div>
+              </div>
+            )}
             {user ? (
               <div className="flex items-center gap-3">
                 <div className="hidden sm:flex flex-col items-end">
                   <span className="text-[10px] font-bold opacity-80">{user.displayName}</span>
-                  <button onClick={signOut} className="text-[8px] uppercase tracking-widest opacity-40 hover:opacity-100 transition-opacity">
-                    {t.signOut || 'Sign Out'}
-                  </button>
+                  <Tooltip>
+                    <TooltipTrigger 
+                      onClick={signOut} 
+                      className="text-[8px] uppercase tracking-widest opacity-40 hover:opacity-100 transition-opacity"
+                    >
+                      {t.signOut || 'Sign Out'}
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      <p>End your current session</p>
+                    </TooltipContent>
+                  </Tooltip>
                 </div>
-                <img src={user.photoURL || ''} alt="User" className="w-8 h-8 rounded-full border border-white/10" referrerPolicy="no-referrer" />
+                <Tooltip>
+                  <TooltipTrigger>
+                    <img 
+                      src={user.photoURL || ''} 
+                      alt="User" 
+                      className="w-8 h-8 rounded-full border border-white/10 cursor-help" 
+                      referrerPolicy="no-referrer" 
+                    />
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>{user.displayName || 'User Profile'}</p>
+                  </TooltipContent>
+                </Tooltip>
               </div>
             ) : (
-              <button 
-                onClick={signIn}
+              <Tooltip>
+                <TooltipTrigger 
+                  onClick={signIn}
+                  className="text-[10px] md:text-xs uppercase tracking-[0.2em] opacity-40 hover:opacity-100 flex items-center gap-2 transition-opacity"
+                >
+                  <Users className="w-4 h-4" /> {t.signIn || 'Sign In'}
+                </TooltipTrigger>
+                <TooltipContent>
+                  <p>Sign in to save and share simulations</p>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            <Tooltip>
+              <TooltipTrigger 
+                onClick={() => setIsHistoryOpen(true)}
                 className="text-[10px] md:text-xs uppercase tracking-[0.2em] opacity-40 hover:opacity-100 flex items-center gap-2 transition-opacity"
               >
-                <Users className="w-4 h-4" /> {t.signIn || 'Sign In'}
-              </button>
-            )}
-            <button 
-              onClick={() => setIsHistoryOpen(true)}
-              className="text-[10px] md:text-xs uppercase tracking-[0.2em] opacity-40 hover:opacity-100 flex items-center gap-2 transition-opacity"
-            >
-              <History className="w-4 h-4" /> <span className="hidden sm:inline">{t.history}</span>
-            </button>
+                <History className="w-4 h-4" /> <span className="hidden sm:inline">{t.history}</span>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>View your previous foresight simulations</p>
+              </TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger 
+                onClick={() => setActiveTab(activeTab === 'simulation' ? 'dashboard' : 'simulation')}
+                className={`text-[10px] md:text-xs uppercase tracking-[0.2em] flex items-center gap-2 transition-all px-3 py-1.5 rounded-full ${activeTab === 'dashboard' ? 'bg-[#ff4e00] text-white opacity-100' : 'opacity-40 hover:opacity-100'}`}
+              >
+                <BarChart2 className="w-4 h-4" /> <span className="hidden sm:inline">Dashboard</span>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>{activeTab === 'dashboard' ? 'Return to simulation' : 'View accuracy metrics and trends'}</p>
+              </TooltipContent>
+            </Tooltip>
             <div className="text-[10px] md:text-xs uppercase tracking-[0.2em] opacity-40 font-mono hidden md:block">
               {state.status === 'idle' ? t.systemReady : `${t.status}: ${state.status}`}
             </div>
@@ -808,64 +1149,89 @@ Generated by MiroFish Systems
         </header>
 
         <AnimatePresence mode="wait">
-          {state.status === 'idle' && !sessionId && (
+          {activeTab === 'dashboard' ? (
             <motion.div
-              key="idle"
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -20 }}
-              className="flex-1 flex flex-col justify-center items-center text-center"
+              key="dashboard"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+              className="flex-1"
             >
-              <h2 className="text-4xl md:text-7xl font-light leading-tight mb-6 md:mb-8 tracking-tight">
+              <div className="mb-12 text-center">
+                <h2 className="text-4xl md:text-6xl font-light tracking-tight mb-4 italic">Accuracy Dashboard</h2>
+                <p className="opacity-40 uppercase tracking-[0.3em] text-xs">Benchmarking Foresight against Reality</p>
+              </div>
+              <AccuracyDashboard history={state.history} />
+            </motion.div>
+          ) : (
+            <React.Fragment key="simulation">
+              {state.status === 'idle' && !sessionId && (
+                <motion.div
+                  key="idle"
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -20 }}
+                  className="flex-1 flex flex-col justify-center items-center text-center"
+                >
+                  <h2 className="text-4xl md:text-7xl font-light leading-tight mb-6 md:mb-8 tracking-tight">
                 {t.heroTitle}
               </h2>
               <p className="max-w-xl text-base md:text-lg opacity-60 mb-8 md:mb-12 leading-relaxed px-4">
                 {t.heroSubtitle}
               </p>
 
-              <div className="w-full max-w-2xl flex flex-col gap-4 px-4">
-                <div className="flex items-center justify-center gap-4 mb-2">
-                  <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-full px-4 py-2">
-                    <Globe className="w-4 h-4 text-[#ff4e00]" />
-                    <select 
-                      value={state.language}
-                      onChange={(e) => setState(prev => ({ ...prev, language: e.target.value }))}
-                      className="bg-transparent text-[10px] md:text-xs uppercase tracking-widest font-bold focus:outline-none cursor-pointer"
-                    >
-                      {LANGUAGES.map(lang => (
-                        <option key={lang.value} value={lang.value} className="bg-[#150d0a]">{lang.label}</option>
-                      ))}
-                    </select>
+                <div className="w-full max-w-2xl flex flex-col gap-4 px-4">
+                  <div className="flex items-center justify-center gap-4 mb-2">
+                    <div className="flex items-center gap-2 bg-white/5 border border-white/10 rounded-full px-4 py-2">
+                      <Globe className="w-4 h-4 text-[#ff4e00]" />
+                      <select 
+                        value={state.language}
+                        onChange={(e) => setState(prev => ({ ...prev, language: e.target.value }))}
+                        className="bg-transparent text-[10px] md:text-xs uppercase tracking-widest font-bold focus:outline-none cursor-pointer"
+                      >
+                        {LANGUAGES.map(lang => (
+                          <option key={lang.value} value={lang.value} className="bg-[#150d0a]">{lang.label}</option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
-                </div>
 
-                <form onSubmit={handleStartSimulation} className="relative group">
-                  <input
-                    type="text"
-                    value={state.question}
-                    onChange={(e) => setState(prev => ({ ...prev, question: e.target.value }))}
-                    placeholder={isListening ? t.listening : t.placeholder}
-                    className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 md:px-8 py-5 md:py-6 text-lg md:text-xl focus:outline-none focus:border-[#ff4e00]/50 focus:bg-white/10 transition-all pr-28 md:pr-36 shadow-2xl backdrop-blur-xl"
-                  />
-                  <div className="absolute right-2 top-2 bottom-2 flex gap-2">
-                    <button
-                      type="button"
-                      onClick={toggleListening}
-                      className={`px-3 md:px-4 rounded-xl flex items-center justify-center transition-all ${isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-white/5 text-white/40 hover:bg-white/10 hover:text-white'}`}
-                      title="Speak to Text"
-                    >
-                      {isListening ? <MicOff className="w-5 h-5 md:w-6 md:h-6" /> : <Mic className="w-5 h-5 md:w-6 md:h-6" />}
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={!state.question.trim()}
-                      className="px-4 md:px-6 bg-[#ff4e00] text-white rounded-xl flex items-center justify-center hover:bg-[#ff6a26] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      <ArrowRight className="w-5 h-5 md:w-6 md:h-6" />
-                    </button>
-                  </div>
-                </form>
-              </div>
+                  <form onSubmit={handleStartSimulation} className="relative group">
+                    <input
+                      type="text"
+                      value={state.question}
+                      onChange={(e) => setState(prev => ({ ...prev, question: e.target.value }))}
+                      placeholder={isListening ? t.listening : t.placeholder}
+                      className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 md:px-8 py-5 md:py-6 text-lg md:text-xl focus:outline-none focus:border-[#ff4e00]/50 focus:bg-white/10 transition-all pr-28 md:pr-36 shadow-2xl backdrop-blur-xl"
+                    />
+                    <div className="absolute right-2 top-2 bottom-2 flex gap-2">
+                      <Tooltip>
+                        <TooltipTrigger 
+                          type="button"
+                          onClick={toggleListening}
+                          className={`px-3 md:px-4 rounded-xl flex items-center justify-center transition-all ${isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-white/5 text-white/40 hover:bg-white/10 hover:text-white'}`}
+                        >
+                          {isListening ? <MicOff className="w-5 h-5 md:w-6 md:h-6" /> : <Mic className="w-5 h-5 md:w-6 md:h-6" />}
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p>{isListening ? 'Stop listening' : 'Use voice input'}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                      <Tooltip>
+                        <TooltipTrigger 
+                          type="submit"
+                          disabled={!state.question.trim()}
+                          className="px-4 md:px-6 bg-[#ff4e00] text-white rounded-xl flex items-center justify-center hover:bg-[#ff6a26] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <ArrowRight className="w-5 h-5 md:w-6 md:h-6" />
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p>Begin the digital society simulation</p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                  </form>
+                </div>
               
               <div className="mt-12 flex flex-wrap justify-center gap-4 md:gap-8 text-[10px] md:text-xs uppercase tracking-widest opacity-30">
                 <div className="flex items-center gap-2"><Users className="w-4 h-4" /> {t.analysts}</div>
@@ -912,7 +1278,139 @@ Generated by MiroFish Systems
             </motion.div>
           )}
 
-          {(state.status === 'initializing' || state.status === 'simulating' || state.status === 'synthesizing' || state.status === 'completed') && (
+          {state.status === 'initializing' && (
+            <motion.div
+              key="initializing"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="flex-1 flex flex-col justify-center items-center text-center"
+            >
+              <div className="relative w-32 h-32 mb-8">
+                <motion.div 
+                  animate={{ rotate: 360 }}
+                  transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
+                  className="absolute inset-0 border-t-2 border-r-2 border-[#ff4e00] rounded-full"
+                />
+                <motion.div 
+                  animate={{ rotate: -360 }}
+                  transition={{ duration: 6, repeat: Infinity, ease: "linear" }}
+                  className="absolute inset-4 border-b-2 border-l-2 border-[#ff4e00]/30 rounded-full"
+                />
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <Users className="w-10 h-10 text-[#ff4e00] animate-pulse" />
+                </div>
+              </div>
+              <h2 className="text-2xl font-bold mb-2 uppercase tracking-widest italic">Assembling Digital Society</h2>
+              <p className="opacity-40 text-xs uppercase tracking-[0.3em]">Identifying expert personas for your inquiry...</p>
+            </motion.div>
+          )}
+
+          {state.status === 'reviewing_agents' && (
+            <motion.div
+              key="reviewing-agents"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="flex-1 flex flex-col gap-8"
+            >
+              <div className="text-center mb-8">
+                <h2 className="text-3xl md:text-5xl font-light mb-4 tracking-tight">The Digital Society</h2>
+                <p className="opacity-60 max-w-xl mx-auto">
+                  Gemini has identified these expert personas to debate your inquiry. Customize their backgrounds to refine the simulation.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {state.agents.map((agent) => (
+                  <motion.div
+                    key={agent.id}
+                    layoutId={agent.id}
+                    className="bg-white/5 border border-white/10 rounded-3xl p-6 backdrop-blur-md flex flex-col gap-4 group hover:bg-white/10 transition-all"
+                  >
+                    <div className="flex items-center gap-4">
+                      <div className="relative">
+                        <Tooltip>
+                          <TooltipTrigger>
+                            <img src={agent.avatar} alt={agent.name} className="w-16 h-16 rounded-2xl border-2 cursor-help" style={{ borderColor: agent.color }} referrerPolicy="no-referrer" />
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Digital persona avatar</p>
+                          </TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger>
+                            <div className="absolute -bottom-1 -right-1 w-6 h-6 rounded-lg flex items-center justify-center text-[10px] font-bold text-white shadow-lg cursor-help" style={{ backgroundColor: agent.color }}>
+                              {agent.reputation}
+                            </div>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Agent reputation score</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </div>
+                      <div className="flex-1">
+                        <input 
+                          value={agent.name}
+                          onFocus={() => setEditingAgentId(agent.id)}
+                          onBlur={() => setEditingAgentId(null)}
+                          onChange={(e) => handleUpdateAgent(agent.id, { name: e.target.value })}
+                          className="w-full bg-transparent font-bold text-lg focus:outline-none border-b border-transparent focus:border-[#ff4e00]/50"
+                        />
+                        <input 
+                          value={agent.role}
+                          onFocus={() => setEditingAgentId(agent.id)}
+                          onBlur={() => setEditingAgentId(null)}
+                          onChange={(e) => handleUpdateAgent(agent.id, { role: e.target.value })}
+                          className="w-full bg-transparent text-xs opacity-60 uppercase tracking-widest focus:outline-none border-b border-transparent focus:border-[#ff4e00]/50"
+                        />
+                        <div className="flex items-center gap-2 mt-1">
+                          <span className="text-[8px] bg-white/10 px-1.5 py-0.5 rounded uppercase tracking-widest opacity-40">{agent.demographics.ageRange}</span>
+                          <span className="text-[8px] bg-white/10 px-1.5 py-0.5 rounded uppercase tracking-widest opacity-40">{agent.demographics.segment}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <textarea 
+                      value={agent.background}
+                      onFocus={() => setEditingAgentId(agent.id)}
+                      onBlur={() => setEditingAgentId(null)}
+                      onChange={(e) => handleUpdateAgent(agent.id, { background: e.target.value })}
+                      className="flex-1 bg-white/5 rounded-xl p-3 text-xs leading-relaxed opacity-80 focus:outline-none focus:bg-white/10 transition-all resize-none h-24"
+                      placeholder="Agent background and personality..."
+                    />
+                    <Tooltip>
+                      <TooltipTrigger 
+                        onClick={() => setIsCustomizingAgent(agent.id)}
+                        className="text-[10px] uppercase tracking-widest opacity-40 hover:opacity-100 flex items-center gap-1 transition-opacity self-end"
+                      >
+                        <Sparkles className="w-3 h-3" /> Regenerate Avatar
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>Customize or regenerate this agent's appearance</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </motion.div>
+                ))}
+              </div>
+
+              <div className="flex justify-center mt-8">
+                <Tooltip>
+                  <TooltipTrigger 
+                    onClick={handleConfirmAgents}
+                    className="px-12 py-5 bg-[#ff4e00] text-white rounded-2xl font-bold hover:bg-[#ff6a26] transition-all flex items-center gap-3 shadow-2xl group"
+                  >
+                    <Sparkles className="w-5 h-5 group-hover:rotate-12 transition-transform" />
+                    Initiate Foresight Debate
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    <p>Start the AI-driven debate between these personas</p>
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+            </motion.div>
+          )}
+
+          {(state.status === 'simulating' || state.status === 'synthesizing' || state.status === 'completed') && (
             <motion.div
               key="simulation"
               initial={{ opacity: 0 }}
@@ -927,12 +1425,28 @@ Generated by MiroFish Systems
                     <span className="text-[10px] bg-white/10 px-2 py-0.5 rounded-full opacity-60">{state.language}</span>
                   </div>
                   <div className="flex items-center gap-4">
-                    <button onClick={shareSession} className="text-xs opacity-40 hover:opacity-100 flex items-center gap-1 transition-opacity">
-                      <Share2 className="w-3 h-3" /> {copied ? t.copied : t.share}
-                    </button>
-                    <button onClick={reset} className="text-xs opacity-40 hover:opacity-100 flex items-center gap-1 transition-opacity">
-                      <RefreshCcw className="w-3 h-3" /> {t.newInquiry}
-                    </button>
+                    <Tooltip>
+                      <TooltipTrigger 
+                        onClick={shareSession} 
+                        className="text-xs opacity-40 hover:opacity-100 flex items-center gap-1 transition-opacity"
+                      >
+                        <Share2 className="w-3 h-3" /> {copied ? t.copied : t.share}
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>Share this simulation session via URL</p>
+                      </TooltipContent>
+                    </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger 
+                        onClick={reset} 
+                        className="text-xs opacity-40 hover:opacity-100 flex items-center gap-1 transition-opacity"
+                      >
+                        <RefreshCcw className="w-3 h-3" /> {t.newInquiry}
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p>Start a new foresight simulation</p>
+                      </TooltipContent>
+                    </Tooltip>
                   </div>
                 </div>
                 <h3 className="text-xl md:text-2xl font-medium italic font-serif">"{state.question}"</h3>
@@ -975,13 +1489,17 @@ Generated by MiroFish Systems
                           </div>
                           <div className="text-[10px] uppercase tracking-wider opacity-40 truncate">{agent.role}</div>
                         </div>
-                        <button 
-                          onClick={() => setIsCustomizingAgent(agent.id)}
-                          className="p-1.5 opacity-0 group-hover:opacity-40 hover:opacity-100 transition-opacity"
-                          title="Customize Avatar"
-                        >
-                          <Sparkles className="w-3 h-3" />
-                        </button>
+                        <Tooltip>
+                          <TooltipTrigger 
+                            onClick={() => setIsCustomizingAgent(agent.id)}
+                            className="p-1.5 opacity-0 group-hover:opacity-40 hover:opacity-100 transition-opacity"
+                          >
+                            <Sparkles className="w-3 h-3" />
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Customize Avatar</p>
+                          </TooltipContent>
+                        </Tooltip>
                       </motion.div>
                     ))
                   )}
@@ -993,19 +1511,29 @@ Generated by MiroFish Systems
                     <span>{t.liveSynthesis}</span>
                     {state.status === 'completed' && (
                       <div className="flex gap-4">
-                        <button 
-                          onClick={() => exportToTxt(state.question, state.agents, state.messages, state.synthesis || '')}
-                          className="flex items-center gap-2 hover:text-[#ff4e00] transition-colors"
-                        >
-                          <Download className="w-3 h-3" /> <span className="hidden sm:inline">{t.exportTxt}</span>
-                        </button>
-                        <button 
-                          onClick={copyToClipboard}
-                          className="flex items-center gap-2 hover:text-[#ff4e00] transition-colors"
-                        >
-                          {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                          {copied ? t.copied : <span className="hidden sm:inline">{t.copyDebate}</span>}
-                        </button>
+                        <Tooltip>
+                          <TooltipTrigger 
+                            onClick={() => exportToTxt(state.question, state.agents, state.messages, state.synthesis || '')}
+                            className="flex items-center gap-2 hover:text-[#ff4e00] transition-colors"
+                          >
+                            <Download className="w-3 h-3" /> <span className="hidden sm:inline">{t.exportTxt}</span>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Download the simulation report as a text file</p>
+                          </TooltipContent>
+                        </Tooltip>
+                        <Tooltip>
+                          <TooltipTrigger 
+                            onClick={copyToClipboard}
+                            className="flex items-center gap-2 hover:text-[#ff4e00] transition-colors"
+                          >
+                            {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                            {copied ? t.copied : <span className="hidden sm:inline">{t.copyDebate}</span>}
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Copy the synthesis to your clipboard</p>
+                          </TooltipContent>
+                        </Tooltip>
                       </div>
                     )}
                   </h4>
@@ -1055,6 +1583,16 @@ Generated by MiroFish Systems
                       </motion.div>
                     )}
 
+                    {state.status === 'completed' && state.impactHeatmap && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="mt-8"
+                      >
+                        <SocietalHeatmap points={state.impactHeatmap} agents={state.agents} />
+                      </motion.div>
+                    )}
+
                     {state.status === 'completed' && state.synthesis && (
                       <motion.div
                         initial={{ opacity: 0, scale: 0.95 }}
@@ -1067,31 +1605,68 @@ Generated by MiroFish Systems
                         <div className="flex justify-between items-start mb-4">
                           <h5 className="text-[10px] md:text-xs uppercase tracking-[0.3em] font-bold opacity-80">{t.finalForesight}</h5>
                           <div className="flex gap-2">
-                            <button 
-                              onClick={() => exportToTxt(state.question, state.agents, state.messages, state.synthesis || '')}
-                              className="p-2 bg-black/20 hover:bg-black/40 rounded-lg transition-colors"
-                              title={t.exportTxt}
-                            >
-                              <Download className="w-4 h-4" />
-                            </button>
-                            <button 
-                              onClick={copyToClipboard}
-                              className="p-2 bg-black/20 hover:bg-black/40 rounded-lg transition-colors"
-                              title={t.copyDebate}
-                            >
-                              {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
-                            </button>
+                            {state.validation ? (
+                              <Tooltip>
+                                <TooltipTrigger className="flex items-center gap-2 bg-white/20 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-widest cursor-help">
+                                  <CheckCircle2 className="w-3 h-3" />
+                                  {state.validation.accuracyScore}% Accuracy
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <p>Accuracy score based on real-world validation</p>
+                                </TooltipContent>
+                              </Tooltip>
+                            ) : (
+                              <Tooltip>
+                                <TooltipTrigger 
+                                  onClick={() => setIsValidationModalOpen(true)}
+                                  className="flex items-center gap-2 bg-white/20 hover:bg-white/30 px-3 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-widest transition-colors"
+                                >
+                                  <Target className="w-3 h-3" />
+                                  Benchmark
+                                </TooltipTrigger>
+                                <TooltipContent>
+                                  <p>Validate this foresight against actual real-world outcomes</p>
+                                </TooltipContent>
+                              </Tooltip>
+                            )}
+                            <Tooltip>
+                              <TooltipTrigger 
+                                onClick={() => exportToTxt(state.question, state.agents, state.messages, state.synthesis || '')}
+                                className="p-2 bg-black/20 hover:bg-black/40 rounded-lg transition-colors"
+                              >
+                                <Download className="w-4 h-4" />
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                <p>Download foresight report</p>
+                              </TooltipContent>
+                            </Tooltip>
+                            <Tooltip>
+                              <TooltipTrigger 
+                                onClick={copyToClipboard}
+                                className="p-2 bg-black/20 hover:bg-black/40 rounded-lg transition-colors"
+                              >
+                                {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                <p>Copy synthesis text</p>
+                              </TooltipContent>
+                            </Tooltip>
                           </div>
                         </div>
                         <div className="text-lg md:text-2xl font-serif italic leading-snug">
                           {state.synthesis}
                         </div>
-                        <button 
-                          onClick={reset}
-                          className="mt-8 flex items-center gap-2 text-[10px] md:text-xs uppercase tracking-widest font-bold bg-black/20 hover:bg-black/40 px-4 py-2 rounded-full transition-colors"
-                        >
-                          {t.newSimulation} <ChevronRight className="w-4 h-4" />
-                        </button>
+                        <Tooltip>
+                          <TooltipTrigger 
+                            onClick={reset}
+                            className="mt-8 flex items-center gap-2 text-[10px] md:text-xs uppercase tracking-widest font-bold bg-black/20 hover:bg-black/40 px-4 py-2 rounded-full transition-colors"
+                          >
+                            {t.newSimulation} <ChevronRight className="w-4 h-4" />
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <p>Clear current results and start over</p>
+                          </TooltipContent>
+                        </Tooltip>
                       </motion.div>
                     )}
                     <div ref={messagesEndRef} />
@@ -1121,7 +1696,9 @@ Generated by MiroFish Systems
               </button>
             </motion.div>
           )}
-        </AnimatePresence>
+        </React.Fragment>
+      )}
+    </AnimatePresence>
 
         {/* Footer */}
         <footer className="mt-16 pt-8 border-t border-white/5 flex flex-col md:flex-row items-center justify-between gap-4 text-[10px] uppercase tracking-widest opacity-30 font-mono">
@@ -1132,8 +1709,64 @@ Generated by MiroFish Systems
             <a href="#" className="hover:opacity-100 transition-opacity">{t.privacy}</a>
           </div>
         </footer>
+        {/* Validation Modal */}
+        <AnimatePresence>
+          {isValidationModalOpen && (
+            <div className="fixed inset-0 z-[110] flex items-center justify-center p-6 bg-black/80 backdrop-blur-md">
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.9, y: 20 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.9, y: 20 }}
+                className="max-w-lg w-full bg-[#1a1512] border border-white/10 rounded-3xl p-8 shadow-2xl"
+              >
+                <div className="flex items-center gap-4 mb-6">
+                  <div className="w-12 h-12 bg-[#ff4e00]/20 rounded-2xl flex items-center justify-center">
+                    <Target className="w-6 h-6 text-[#ff4e00]" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-bold italic">Benchmark Foresight</h3>
+                    <p className="text-[10px] opacity-40 uppercase tracking-widest">Validate AI predictions against reality</p>
+                  </div>
+                </div>
+
+                <div className="space-y-6">
+                  <div>
+                    <label className="text-[10px] uppercase tracking-widest font-bold opacity-40 mb-2 block">Actual Real-World Outcome</label>
+                    <textarea 
+                      value={validationInput}
+                      onChange={(e) => setValidationInput(e.target.value)}
+                      placeholder="Describe what actually happened in the real world..."
+                      className="w-full bg-white/5 border border-white/10 rounded-2xl p-4 text-sm focus:outline-none focus:border-[#ff4e00]/50 min-h-[120px] resize-none"
+                    />
+                  </div>
+
+                  <div className="flex gap-4">
+                    <button 
+                      onClick={() => setIsValidationModalOpen(false)}
+                      className="flex-1 py-4 bg-white/5 hover:bg-white/10 rounded-2xl font-bold transition-all text-xs uppercase tracking-widest"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      onClick={handleValidate}
+                      disabled={isValidating || !validationInput}
+                      className="flex-1 py-4 bg-[#ff4e00] hover:bg-[#ff6a26] disabled:opacity-50 disabled:cursor-not-allowed rounded-2xl font-bold transition-all text-xs uppercase tracking-widest flex items-center justify-center gap-2"
+                    >
+                      {isValidating ? (
+                        <RefreshCcw className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <>Validate Outcome</>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
       </main>
     </div>
+    </TooltipProvider>
     </ErrorBoundary>
   );
 }

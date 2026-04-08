@@ -7,8 +7,16 @@ export const generateAgents = async (question: string, language: string, existin
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
     contents: `Based on the following question/data: "${question}", identify 5 diverse expert personas (roles) that would be most relevant to debate this. 
-    IMPORTANT: All names and roles MUST be written in ${language}.
-    Return them as a JSON array of objects with "name", "role", and "color" (hex).`,
+    For each, provide:
+    1. "name"
+    2. "role"
+    3. "background" (1-2 sentences)
+    4. "color" (hex)
+    5. "location" (object with x, y between 0 and 1, representing their position in a 2D demographic/geographic space)
+    6. "demographics" (object with "ageRange" and "segment")
+    
+    IMPORTANT: All names, roles, backgrounds, and demographics MUST be written in ${language}.
+    Return them as a JSON array of objects.`,
     config: {
       responseMimeType: "application/json",
       responseSchema: {
@@ -18,9 +26,26 @@ export const generateAgents = async (question: string, language: string, existin
           properties: {
             name: { type: Type.STRING },
             role: { type: Type.STRING },
+            background: { type: Type.STRING },
             color: { type: Type.STRING },
+            location: {
+              type: Type.OBJECT,
+              properties: {
+                x: { type: Type.NUMBER },
+                y: { type: Type.NUMBER },
+              },
+              required: ["x", "y"],
+            },
+            demographics: {
+              type: Type.OBJECT,
+              properties: {
+                ageRange: { type: Type.STRING },
+                segment: { type: Type.STRING },
+              },
+              required: ["ageRange", "segment"],
+            },
           },
-          required: ["name", "role", "color"],
+          required: ["name", "role", "background", "color", "location", "demographics"],
         },
       },
     },
@@ -35,38 +60,60 @@ export const generateAgents = async (question: string, language: string, existin
   }));
 };
 
-export const simulateDebate = async (question: string, agents: Agent[], language: string): Promise<{ messages: Message[], reputationChanges: Record<string, number> }> => {
-  const agentDescriptions = agents.map(a => `${a.name} (${a.role}, Rep: ${a.reputation})`).join(", ");
+export const simulateDebate = async (question: string, agents: Agent[], language: string): Promise<{ messages: Message[], reputationChanges: Record<string, number>, impactHeatmap: any[] }> => {
+  const agentDescriptions = agents.map(a => `${a.name} (${a.role}, Background: ${a.background}, Rep: ${a.reputation})`).join(", ");
   const response = await ai.models.generateContent({
     model: "gemini-3-flash-preview",
     contents: `Question: "${question}"
     Agents: ${agentDescriptions}
     Language: ${language}
     
-    Simulate a heated, argumentative debate between these agents. Each agent should provide one sharp, critical perspective (max 2 sentences) that challenges or builds upon the others. They should "react" to the previous points.
+    1. Simulate a heated, argumentative debate between these agents. Each agent should provide one sharp, critical perspective (max 2 sentences).
+    2. For each argument, assign a "reputationChange" (-5 to +5).
+    3. Generate a "societalImpact" heatmap. This should be 15-20 points representing how different segments of the "Digital Society" (beyond just the 5 agents) are reacting. 
+       Each point needs: "x" (0-1), "y" (0-1), "value" (-1 to 1, where -1 is highly negative/fearful and 1 is highly positive/enthusiastic), and "label" (a short 2-3 word description of the segment, e.g., "Gen Z Techies", "Rural Traditionalists").
     
-    CRITICAL: For each argument, assign a "reputationChange" (integer between -5 and +5) based on the validity, impact, and logical strength of the argument.
-    
-    IMPORTANT: The entire debate MUST be written in ${language}.
-    Return the debate as a JSON array of objects with "agentName", "content", and "reputationChange".`,
+    IMPORTANT: The entire debate and labels MUST be written in ${language}.
+    Return a JSON object with "debate" (array of {agentName, content, reputationChange}) and "impactHeatmap" (array of {x, y, value, label}).`,
     config: {
       responseMimeType: "application/json",
       responseSchema: {
-        type: Type.ARRAY,
-        items: {
-          type: Type.OBJECT,
-          properties: {
-            agentName: { type: Type.STRING },
-            content: { type: Type.STRING },
-            reputationChange: { type: Type.INTEGER },
+        type: Type.OBJECT,
+        properties: {
+          debate: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                agentName: { type: Type.STRING },
+                content: { type: Type.STRING },
+                reputationChange: { type: Type.INTEGER },
+              },
+              required: ["agentName", "content", "reputationChange"],
+            },
           },
-          required: ["agentName", "content", "reputationChange"],
+          impactHeatmap: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                x: { type: Type.NUMBER },
+                y: { type: Type.NUMBER },
+                value: { type: Type.NUMBER },
+                label: { type: Type.STRING },
+              },
+              required: ["x", "y", "value", "label"],
+            },
+          },
         },
+        required: ["debate", "impactHeatmap"],
       },
     },
   });
 
-  const data = JSON.parse(response.text || "[]");
+  const rawData = JSON.parse(response.text || "{}");
+  const data = rawData.debate || [];
+  const impactHeatmap = rawData.impactHeatmap || [];
   const reputationChanges: Record<string, number> = {};
   
   const messages = data.map((d: any) => {
@@ -81,7 +128,7 @@ export const simulateDebate = async (question: string, agents: Agent[], language
     };
   });
 
-  return { messages, reputationChanges };
+  return { messages, reputationChanges, impactHeatmap };
 };
 
 export const synthesizeForesight = async (question: string, messages: Message[], agents: Agent[], language: string): Promise<string> => {
@@ -102,6 +149,40 @@ export const synthesizeForesight = async (question: string, messages: Message[],
   });
 
   return response.text || "No foresight generated.";
+};
+
+export const validateForesight = async (question: string, synthesis: string, actualOutcome: string, language: string): Promise<{ accuracyScore: number, validationReport: string }> => {
+  const response = await ai.models.generateContent({
+    model: "gemini-3-flash-preview",
+    contents: `Question: "${question}"
+    AI Foresight Synthesis: "${synthesis}"
+    Actual Real-World Outcome: "${actualOutcome}"
+    Language: ${language}
+    
+    Compare the AI's foresight prediction with the actual outcome. 
+    1. Assign an "accuracyScore" (0-100) based on how well the AI predicted the key trends, sentiments, and outcomes.
+    2. Provide a "validationReport" (max 3 sentences) explaining the score, highlighting what the AI got right and what it missed.
+    
+    IMPORTANT: The report MUST be written in ${language}.
+    Return a JSON object with "accuracyScore" and "validationReport".`,
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          accuracyScore: { type: Type.INTEGER },
+          validationReport: { type: Type.STRING },
+        },
+        required: ["accuracyScore", "validationReport"],
+      },
+    },
+  });
+
+  const data = JSON.parse(response.text || "{}");
+  return {
+    accuracyScore: data.accuracyScore || 0,
+    validationReport: data.validationReport || "Validation unavailable."
+  };
 };
 
 export const generateAvatar = async (role: string, name: string, customPrompt?: string): Promise<string> => {

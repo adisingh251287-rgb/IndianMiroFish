@@ -51,7 +51,7 @@ service cloud.firestore {
     function isValidSimulation(data) {
       return data.question is string && data.question.size() > 0 && data.question.size() <= 500 &&
              data.language is string &&
-             data.status in ['idle', 'initializing', 'simulating', 'synthesizing', 'completed', 'error'] &&
+             data.status in ['idle', 'initializing', 'reviewing_agents', 'simulating', 'synthesizing', 'completed', 'error'] &&
              data.agents is list && data.agents.size() <= 10 &&
              data.messages is list && data.messages.size() <= 100 &&
              (!('synthesis' in data) || (data.synthesis is string && data.synthesis.size() <= 5000)) &&
@@ -80,11 +80,23 @@ service cloud.firestore {
                       request.resource.data.timestamp == resource.data.timestamp;
                       
       allow delete: if isAdmin();
+
+      match /presence/{userId} {
+        allow read: if isAuthenticated();
+        allow write: if isOwner(userId);
+      }
     }
 
     match /users/{userId} {
       allow read: if isAuthenticated();
-      allow write: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && 
+                      request.resource.data.hasPaid == false &&
+                      !('subscriptionId' in request.resource.data);
+      allow update: if isOwner(userId) && 
+                      request.resource.data.hasPaid == resource.data.hasPaid &&
+                      (!('subscriptionId' in request.resource.data) || request.resource.data.subscriptionId == resource.data.subscriptionId) &&
+                      (!('subscriptionStatus' in request.resource.data) || request.resource.data.subscriptionStatus == resource.data.subscriptionStatus);
+      allow write: if isAdmin();
     }
 
     // Default deny
